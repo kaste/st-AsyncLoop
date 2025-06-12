@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import sublime
+import threading
 
 # --- Core ---
 
@@ -65,10 +66,49 @@ class SublimeEventLoop(asyncio.BaseEventLoop):
 
 ui_loop = SublimeEventLoop(use_async=False)
 worker_loop = SublimeEventLoop(use_async=True)
+
+_thread_local = threading.local()
 original_get_running_loop = asyncio.events.get_running_loop
+original_get_event_loop = asyncio.events.get_event_loop
+
+
+def set_event_loop(loop: asyncio.AbstractEventLoop):
+    _thread_local.loop = loop
+
+
 def get_running_loop():
-    return ui_loop if threading.current_thread().name.lower().startswith("m") else worker_loop
+    try:
+        return _thread_local.loop
+    except AttributeError:
+        return original_get_running_loop()
+
+
+def get_event_loop():
+    try:
+        return get_running_loop()
+    except RuntimeError:
+        return original_get_event_loop()
+
+
 asyncio.events.get_running_loop = get_running_loop
+asyncio.events.get_event_loop = get_event_loop
+
+
+def unpatch_asyncio():
+    asyncio.events.get_running_loop = original_get_running_loop
+    asyncio.events.get_event_loop = original_get_event_loop
+
+
+def plugin_loaded():
+    sublime.set_timeout(main, 10)
+
+def plugin_unloaded():
+    unpatch_asyncio()
+
+
+# original_get_running_loop = asyncio.events.get_running_loop
+# def get_running_loop():
+#     return ui_loop if threading.current_thread().name.lower().startswith("m") else worker_loop
 
 
 # --- Utilities ---
@@ -173,6 +213,3 @@ def main():
     w = sublime.active_window()
     v = w.active_view()
     v.run_command("example_async")
-
-def plugin_loaded():
-    sublime.set_timeout(main, 10)
