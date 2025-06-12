@@ -3,6 +3,7 @@ import functools
 import sublime
 import threading
 
+
 # --- Core ---
 
 class Handle:
@@ -20,8 +21,8 @@ class Handle:
 
 
 class SublimeEventLoop(asyncio.BaseEventLoop):
-    def __init__(self, use_async=False):
-        self.use_async = use_async
+    def __init__(self, scheduler):
+        self._schedule = scheduler
         super().__init__()
 
     def is_running(self):
@@ -32,19 +33,13 @@ class SublimeEventLoop(asyncio.BaseEventLoop):
 
     def call_soon(self, callback, *args, context=None):
         handle = Handle(callback, args)
-        if self.use_async:
-            sublime.set_timeout_async(handle, 0)
-        else:
-            sublime.set_timeout(handle, 0)
+        self._schedule(handle)
         return handle
 
     def call_later(self, delay, callback, *args, context=None):
         handle = Handle(callback, args)
         delay_ms = max(0, int(delay * 1000))
-        if self.use_async:
-            sublime.set_timeout_async(handle, delay_ms)
-        else:
-            sublime.set_timeout(handle, delay_ms)
+        self._schedule(handle, delay_ms)
         return handle
 
     def call_soon_threadsafe(self, callback, *args):
@@ -64,62 +59,56 @@ class SublimeEventLoop(asyncio.BaseEventLoop):
 
 # --- Create UI and Worker loops ---
 
-ui_loop = SublimeEventLoop(use_async=False)
-worker_loop = SublimeEventLoop(use_async=True)
+ui_loop = SublimeEventLoop(sublime.set_timeout)
+worker_loop = SublimeEventLoop(sublime.set_timeout_async)
 
-_thread_local = threading.local()
+local = {}
 original_get_running_loop = asyncio.events.get_running_loop
-original_get_event_loop = asyncio.events.get_event_loop
 
 
-def set_event_loop(loop: asyncio.AbstractEventLoop):
-    _thread_local.loop = loop
+def _set_event_loop(loop: asyncio.AbstractEventLoop):
+    local[threading.get_ident()] = loop
 
 
 def get_running_loop():
     try:
-        return _thread_local.loop
-    except AttributeError:
+        return local[threading.get_ident()]
+    except KeyError:
         return original_get_running_loop()
 
 
-def get_event_loop():
-    try:
-        return get_running_loop()
-    except RuntimeError:
-        return original_get_event_loop()
-
-
 asyncio.events.get_running_loop = get_running_loop
-asyncio.events.get_event_loop = get_event_loop
+_set_event_loop(ui_loop)
+sublime.set_timeout_async(lambda: _set_event_loop(worker_loop))
 
 
 def unpatch_asyncio():
     asyncio.events.get_running_loop = original_get_running_loop
-    asyncio.events.get_event_loop = original_get_event_loop
 
 
 def plugin_loaded():
-    sublime.set_timeout(main, 10)
+    sublime.set_timeout(main2, 1000)
+
 
 def plugin_unloaded():
     unpatch_asyncio()
 
 
-# original_get_running_loop = asyncio.events.get_running_loop
-# def get_running_loop():
-#     return ui_loop if threading.current_thread().name.lower().startswith("m") else worker_loop
-
-
 # --- Utilities ---
 
 def run_on_ui_loop(fn_or_coro):
-    if callable(fn_or_coro):
+    if asyncio.iscoroutine(fn_or_coro):
+        # Direct coroutine passed: schedule and return task
+        return ui_loop.create_task(fn_or_coro)
+
+    elif callable(fn_or_coro):
         @functools.wraps(fn_or_coro)
         def wrapper(*args, **kwargs):
-            return asyncio.ensure_future(fn_or_coro(*args, **kwargs), loop=ui_loop)
+            coro = fn_or_coro(*args, **kwargs)
+            return ui_loop.create_task(coro)
         return wrapper
-    return asyncio.ensure_future(fn_or_coro, loop=ui_loop)
+
+    raise TypeError("run_on_ui_loop expects a coroutine or a callable returning a coroutine")
 
 def run_on_worker_loop(fn_or_coro):
     if callable(fn_or_coro):
@@ -130,10 +119,10 @@ def run_on_worker_loop(fn_or_coro):
     return asyncio.ensure_future(fn_or_coro, loop=worker_loop)
 
 async def switch_to_ui(coro):
-    fut = asyncio.Future(loop=ui_loop)
+    fut = asyncio.Future(loop=worker_loop)
 
     def _schedule():
-        task = asyncio.ensure_future(coro, loop=ui_loop)
+        task = ui_loop.create_task(coro)
         task.add_done_callback(lambda t: _transfer_result(t, fut))
 
     sublime.set_timeout(_schedule, 0)
@@ -160,52 +149,46 @@ def _transfer_result(task, fut):
 
 import sublime
 import sublime_plugin
-# from .async_loops import run_on_ui_loop, run_on_worker_loop, switch_to_worker, switch_to_ui
-import threading
+
+
+def thname():
+    return threading.current_thread().name
+
 
 class example_async(sublime_plugin.TextCommand):
-    # def run(self, edit):
-    #     # Kick off on the UI loop
-    #     print("run")
-    #     print(threading.current_thread().name)
-    #     run_on_ui_loop(self.run_async)(self.view)
-
-    # async def run_async(self, view):
     @run_on_ui_loop
     async def run(self, view):
         view = self.view
         # Extract view content on UI thread
         content = view.substr(sublime.Region(0, view.size()))
-        print("Got content on UI thread")
-        print(threading.current_thread().name)
+        print("Got content on UI thread", thname())
 
         # Process on worker thread
         processed = await switch_to_worker(self.process_in_background(content))
-        print("Got result from worker")
-        print(threading.current_thread().name)
+        print("Got result from worker", thname())
 
         # Draw result on UI thread
-        await switch_to_ui(self.draw_result(view, processed))
-        print("Finished drawing")
-        print(threading.current_thread().name)
+        await self.draw_result(view, processed)
+        print("Finished drawing", thname())
 
     async def process_in_background(self, content):
-        print("process_in_background")
-        print(threading.current_thread().name)
+        print("process_in_background", thname())
         await asyncio.sleep(1)  # Simulate heavy work
-        await self.still_background()
+        file_name = await switch_to_ui(self.more_context())
+        await self.still_background(file_name)
         return content.upper()[:100]  # Dummy "analysis"
 
-    async def still_background(self):
-        print("still_background")
-        print(threading.current_thread().name)
+    async def more_context(self):
+        print("more_context", thname())
+        await asyncio.sleep(0.01)  # Simulate light work
+        return self.view.file_name()
+
+    async def still_background(self, fname):
+        print("still_background", thname(), fname)
         await asyncio.sleep(1)  # Simulate heavy work
 
     async def draw_result(self, view, result):
-        # region = sublime.Region(0, len(result))
-        # view.add_regions("example", [region], "string", "", sublime.DRAW_NO_FILL)
-        print("draw_result", result[:10])
-        print(threading.current_thread().name)
+        print("draw_result", result[:10], thname())
 
 
 def main():
@@ -213,3 +196,44 @@ def main():
     w = sublime.active_window()
     v = w.active_view()
     v.run_command("example_async")
+
+
+
+from itertools import cycle
+
+@run_on_ui_loop
+async def main2():
+    # Showcase that Sublime UI loop has no "holes", i.e. it does not flicker
+    # Abort the spinner with <escape>.
+    print("main2")
+    window = sublime.active_window()
+
+    text = cycle(("Loading...", "Loading.."))
+    ignore_next_abort = False
+    aborted = False
+    sleeper = None
+
+    def done(n):
+        nonlocal aborted, ignore_next_abort
+        if ignore_next_abort:
+            ignore_next_abort = False
+            return
+        if n == -1:
+            aborted = True
+        else:
+            sleeper.cancel()
+
+    for _ in range(10):
+        text_ = next(text)
+        window.show_quick_panel([text_], done)
+        sleeper = run_on_ui_loop(asyncio.sleep(0.3))
+        try:
+            await sleeper
+        except asyncio.CancelledError:
+            pass
+        if aborted:
+            break
+        ignore_next_abort = True
+        window.run_command("hide_overlay")
+    else:
+        print("never resolved")
