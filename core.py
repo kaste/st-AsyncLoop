@@ -25,11 +25,11 @@ class SublimeEventLoop(asyncio.BaseEventLoop):
         self._schedule = scheduler
         super().__init__()
 
-    def is_running(self):
-        return True
+    # def is_running(self):
+    #     return True
 
-    def is_closed(self):
-        return False
+    # def is_closed(self):
+    #     return False
 
     def call_soon(self, callback, *args, context=None):
         handle = Handle(callback, args)
@@ -45,16 +45,16 @@ class SublimeEventLoop(asyncio.BaseEventLoop):
     def call_soon_threadsafe(self, callback, *args):
         return self.call_soon(callback, *args)
 
-    def create_future(self):
-        return asyncio.Future(loop=self)
+    # def create_future(self):
+    #     return asyncio.Future(loop=self)
 
-    def create_task(self, coro):
-        task = asyncio.Task(coro, loop=self)
-        task._log_destroy_pending = False
-        return task
+    # def create_task(self, coro):
+    #     task = asyncio.Task(coro, loop=self)
+    #     task._log_destroy_pending = False
+    #     return task
 
-    def get_debug(self):
-        return False
+    # def get_debug(self):
+    #     return False
 
 
 # --- Create UI and Worker loops ---
@@ -87,6 +87,8 @@ def unpatch_asyncio():
 
 
 def plugin_loaded():
+    # See in the console, that both commands run "in parallel"/coop mode
+    sublime.set_timeout(main, 1000)
     sublime.set_timeout(main2, 1000)
 
 
